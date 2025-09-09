@@ -1,0 +1,6 @@
+dash
+numpy
+scipy
+pylsl
+plotly
+collections
