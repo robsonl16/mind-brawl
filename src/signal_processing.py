@@ -44,8 +44,14 @@ def compute_band_powers(signal, fs):
         powers[band] = np.trapz(psd[idx], freqs[idx])
     return powers
 
-def detect_blink(eeg_buffer, fs, threshold=75, cooldown=0.5, last_blink_time=0):
-    """Detects a blink artifact in the EEG signal."""
+def detect_blink(eeg_buffer, fs, threshold=65, cooldown=0.75, last_blink_time=0):
+    """
+    Detects a blink artifact in the EEG signal.
+    Tuning:
+    - If blinks aren't registering, LOWER the threshold.
+    - If you get false positives (blinks register when you don't blink), INCREASE the threshold or cooldown.
+    """
+    # Use frontal channels for blink detection
     frontal_channels = ['AF7', 'AF8']
     current_time = time.time()
 

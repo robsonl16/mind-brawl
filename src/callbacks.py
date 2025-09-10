@@ -9,7 +9,7 @@ from src.app import app
 from src.data_stream import buffers, timestamps
 from src.signal_processing import apply_filters, compute_band_powers, detect_blink
 from src.layout import get_page_content, get_tab_content
-from src.config import BUFFER_SECONDS, SAMPLING_RATE, EEG_CHANNELS, AXES, UPDATE_INTERVAL_MS
+from src.config import BUFFER_SECONDS, SAMPLING_RATE, EEG_CHANNELS, AXES, UPDATE_INTERVAL_MS, MAX_SHOTS, GAME_DURATION_S
 
 # === Main Layout Callback ===
 @app.callback(Output('main-page-content', 'children'), Input('url', 'pathname'))
@@ -133,22 +133,32 @@ def update_bandpower_graphs(_, active_tab):
 )
 def update_zen_archer(_, n_clicks, game_state, active_tab):
     if active_tab != 'game-tab':
-        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        return [dash.no_update] * 5
 
     ctx = dash.callback_context
+    # Initialize or reset the game when the start button is clicked
     if ctx.triggered and ctx.triggered[0]['prop_id'] == 'start-game-btn.n_clicks':
         game_state = {
-            'score': 0, 'target_pos': (175, 175), 'last_blink_time': time.time(), 'shot_timer': 10.0
+            'score': 0, 'target_pos': (175, 175), 'last_blink_time': time.time(), 
+            'shot_timer': GAME_DURATION_S, 'shot_number': 0,
+            'crosshair_pos': (235, 235)  # Start crosshair in the center
         }
 
+    # If game state hasn't been initialized, do nothing.
+    if not game_state:
+        return [dash.no_update] * 5
+
+    # --- Game Over Check ---
+    if game_state.get('shot_number', 0) >= MAX_SHOTS:
+        state_text = f"GAME OVER | Final Score: {game_state['score']}"
+        return dash.no_update, dash.no_update, dash.no_update, state_text, game_state    
+
     game_state['shot_timer'] -= (UPDATE_INTERVAL_MS / 1000.0)
-    if game_state['shot_timer'] <= 0:
-        game_state['target_pos'] = (np.random.randint(25, 325), np.random.randint(25, 325))
-        game_state['shot_timer'] = 10.0
 
     blinked, new_blink_time = detect_blink(buffers['EEG'], SAMPLING_RATE, last_blink_time=game_state['last_blink_time'])
     game_state['last_blink_time'] = new_blink_time
 
+    # --- Focus Metric Calculation ---
     focus_channels = ['AF7', 'AF8']
     alpha_power, beta_power, num_channels = 0, 0, 0
     for ch in focus_channels:
@@ -161,42 +171,56 @@ def update_zen_archer(_, n_clicks, game_state, active_tab):
                 num_channels += 1
 
     if num_channels == 0:
-        return dash.no_update, dash.no_update, dash.no_update, "Waiting for EEG data...", dash.no_update
+        return dash.no_update, dash.no_update, dash.no_update, "Waiting for EEG data...", game_state
 
-    focus_metric = (beta_power / num_channels) / ((alpha_power / num_channels) + 1e-10)
+    focus_metric = (beta_power / num_channels) / ((alpha_power / num_channels) + 1e-10) if num_channels > 0 else 0
 
+    # --- Gyroscope Input and Crosshair Movement ---
     try:
-        gyro_y, gyro_z = buffers['Gyroscope']['Y'][-1], buffers['Gyroscope']['Z'][-1]
+        # Invert Gyro Z for more natural left/right movement
+        gyro_y, gyro_z = buffers['Gyroscope']['Y'][-1], -buffers['Gyroscope']['Z'][-1]
     except IndexError:
-        return dash.no_update, dash.no_update, dash.no_update, "Waiting for Gyro data...", dash.no_update
+        return dash.no_update, dash.no_update, dash.no_update, "Waiting for Gyro data...", game_state
 
+    # Calculate raw crosshair position based on gyro and focus
     sensitivity = 5
-    crosshair_x = 235 + (gyro_z * sensitivity)
-    crosshair_y = 235 + (gyro_y * sensitivity)
-    shake_magnitude = np.clip(5 / (focus_metric + 1e-10), 1, 20)
-    crosshair_x += np.random.uniform(-shake_magnitude, shake_magnitude)
-    crosshair_y += np.random.uniform(-shake_magnitude, shake_magnitude)
-    crosshair_x = np.clip(crosshair_x, 0, 470)
-    crosshair_y = np.clip(crosshair_y, 0, 470)
+    shake_magnitude = np.clip(8 / (focus_metric + 1e-10), 1, 25)
+    raw_crosshair_x = 235 + (gyro_z * sensitivity) + np.random.uniform(-shake_magnitude, shake_magnitude)
+    raw_crosshair_y = 235 + (gyro_y * sensitivity) + np.random.uniform(-shake_magnitude, shake_magnitude)
 
-    points = 0
-    if blinked:
-        target_center_x = game_state['target_pos'][0] + 75
-        target_center_y = game_state['target_pos'][1] + 75
-        dist_from_center = np.sqrt((crosshair_x - target_center_x)**2 + (crosshair_y - target_center_y)**2)
+    # Apply Smoothing (Exponential Moving Average) for smoother movement
+    smoothing_factor = 0.4
+    prev_x, prev_y = game_state.get('crosshair_pos', (235, 235))
+    smoothed_x = (smoothing_factor * raw_crosshair_x) + ((1 - smoothing_factor) * prev_x)
+    smoothed_y = (smoothing_factor * raw_crosshair_y) + ((1 - smoothing_factor) * prev_y)
+    game_state['crosshair_pos'] = (smoothed_x, smoothed_y)
 
-        if dist_from_center <= 25: points = 100
-        elif dist_from_center <= 50: points = 50
-        elif dist_from_center <= 75: points = 20
+    crosshair_x = np.clip(smoothed_x, 0, 470)
+    crosshair_y = np.clip(smoothed_y, 0, 470)
+
+    # --- Shot and Scoring Logic ---
+    shot_fired = blinked or game_state['shot_timer'] <= 0
+    
+    if shot_fired:
+        points = 0
+        if blinked:  # Only score points if it was a deliberate blink
+            target_center_x = game_state['target_pos'][0] + 75
+            target_center_y = game_state['target_pos'][1] + 75
+            dist_from_center = np.sqrt((crosshair_x - target_center_x)**2 + (crosshair_y - target_center_y)**2)
+
+            if dist_from_center <= 25: points = 100  # Inner ring
+            elif dist_from_center <= 50: points = 50  # Middle ring
+            elif dist_from_center <= 75: points = 20  # Outer ring
         
-        if points > 0: game_state['score'] += points
-        
+        game_state['score'] += points
+        game_state['shot_number'] += 1
         game_state['target_pos'] = (np.random.randint(25, 325), np.random.randint(25, 325))
-        game_state['shot_timer'] = 10.0
+        game_state['shot_timer'] = GAME_DURATION_S # Reset timer for next shot
 
+    # --- Update UI Components ---
     crosshair_style = {
-        'position': 'absolute', 'width': '30px', 'height': '30px', 'border': '2px solid cyan',
-        'top': f'{crosshair_y}px', 'left': f'{crosshair_x}px', 'transition': 'top 0.1s, left 0.1s'
+        'position': 'absolute', 'width': '10px', 'height': '10px', 'border': '2px solid cyan',
+        'top': f'{crosshair_y}px', 'left': f'{crosshair_x}px', 'transition': 'top 0.05s, left 0.05s'
     }
     target_style = {
         'position': 'absolute', 'width': '150px', 'height': '150px',
@@ -206,8 +230,8 @@ def update_zen_archer(_, n_clicks, game_state, active_tab):
     }
     timer_style = {
         'position': 'absolute', 'bottom': '0', 'left': '0', 'height': '10px',
-        'backgroundColor': 'orange', 'width': f"{game_state['shot_timer'] * 10}%"
+        'backgroundColor': 'orange', 'width': f"{(game_state['shot_timer'] / GAME_DURATION_S) * 100}%"
     }
-    state_text = f"Score: {game_state['score']} | Focus: {focus_metric:.2f} | Last Shot: {'HIT!' if blinked and points > 0 else ('MISS' if blinked else '--')}"
+    state_text = f"Score: {game_state['score']} | Shot: {game_state.get('shot_number', 0) + 1}/{MAX_SHOTS} | Focus: {focus_metric:.2f}"
 
     return crosshair_style, target_style, timer_style, state_text, game_state
